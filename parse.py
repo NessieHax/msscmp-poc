@@ -12,8 +12,8 @@ def main():
         raise Exception("Not a Soundbank(.msscmp) file")
 
     with open(args.filepath, "rb") as file:
-        msscmpfile = msscmp.MsscmpParser()
-        msscmpfile.process(file, args.dump, args.verbose)
+        msscmpfile = msscmp.MsscmpParser(args.verbose)
+        msscmpfile.process(file, args.dump)
 
 if __name__ == "__main__":
     main()
