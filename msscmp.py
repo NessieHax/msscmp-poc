@@ -16,16 +16,26 @@
 # 3. This notice may not be removed or altered from any source distribution.
 from dataclasses import dataclass, field
 from io import SEEK_SET, BufferedReader
-from pprint import pprint
+import pprint, datetime
 import struct, os
 from typing import Callable, Any
 
-def log(caller):
-    def logger(*args, **kwargs):
-        res = caller(*args, **kwargs)
-        print(f"{repr(caller.__name__)} returned: {res}")
-        return res
-    return logger
+class Logger:
+    def logFn(logTarget: str | None = ...) -> Callable[[], Any]:
+        def decorater(func: Callable[[Ellipsis], Any]):
+            logFilename = f"{logTarget}.txt" if isinstance(logTarget, str) else f"{func.__name__}.txt"
+            def caller(*args, **kwargs):
+                res = func(*args, **kwargs)
+                with open(logFilename, "a") as logFile:
+                    print(f"[{datetime.datetime.time(datetime.datetime.utcnow())}] {repr(func.__name__)}: {pprint.pformat(res)}", file=logFile)
+                return res
+            return caller
+        return decorater
+
+    def log(__obj: object, logTarget: str | None = ...) -> None:
+        logFilename = f"{logTarget}.txt" if isinstance(logTarget, str) else f"{__obj}.txt"
+        with open(logFilename, "a") as logFile:
+            print(f"[{datetime.datetime.time(datetime.datetime.utcnow())}]: {pprint.pformat(__obj)}", file=logFile)
 
 @dataclass(slots=True)
 class BufferedDataReader:
@@ -48,25 +58,18 @@ class BufferedDataReader:
     def readFloat(self) -> float:
         return self.readFloats(1)[0]
 
+    def readString(self) -> str:
+        return self.readStringAt(self._stream.tell())
+
+    def readStringAt(self, offset: int) -> str:
+        return readAt(self._stream, offset, self.readUntil, b'\x00').decode("UTF-8")
+
     def readUntil(self, stopper: bytes) -> bytes:
         result = bytearray()
         while self._stream.peek(1)[:1] != stopper: result.append(self._stream.read(1)[0])
         return bytes(result)
 
-    def readString(self) -> str:
-        return self.readStringAt(self._stream.tell())
-
-    def readStringAt(self, offset: int) -> str:
-        return self.readStringAtUntil(offset, b'\x00')
-
-    def readStringAtUntil(self, offset: int, stopper: bytes) -> str:
-        origin = self._stream.tell()
-        self._stream.seek(offset, SEEK_SET)
-        result = self.readUntil(stopper)
-        self._stream.seek(origin, SEEK_SET)
-        return result.decode("UTF-8")
-
-def readAt(stream: BufferedReader, offset: int, func: Callable[[], Any], *arg, **kwargs) -> Any:
+def readAt(stream: BufferedReader, offset: int, func: Callable[[Ellipsis], Any], *arg, **kwargs) -> Any:
     origin = stream.tell()
     stream.seek(offset, SEEK_SET)
     result = func(*arg, **kwargs)
@@ -80,14 +83,13 @@ class BankHeader:
     mem_usage: int
     version: int
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BankSource:
     bankPathOffset: int
-    bankPath: str
+    path: str
     file_name: str
     file_size: int
     sample_rate: int
-    volume: float
     data_offset: int
     play_action: int
     unknown_data: dict = field(default_factory=dict)
@@ -95,8 +97,9 @@ class BankSource:
 @dataclass(slots=True)
 class BankEvent:
     name: str
+    raw_string_data_format: str
     sources: list[BankSource] = field(init=False, default_factory=list)
-    unknown_string_data_format: list[str] = field(default_factory=list)
+    properties: list[str] = field(init=False, default_factory=list)
 
 @dataclass(slots=True)
 class BankInfo:
@@ -114,11 +117,11 @@ class MsscmpParser:
         signature = stream.read(4)
         if signature not in  (b'BANK', b'KNAB'):
             raise Exception("File is not a Soundbank.")
-
         reader = BufferedDataReader(stream, '<' if signature == b'KNAB' else '>')
-        self.bankinfo.header = self.readBinkHeader(reader)
 
-        _, event_table_start, source_table_start, *_  = reader.readInts(5) # _, event_offset, 4212, 4212, 4212
+        self.bankinfo.header = self.readBankHeader(reader)
+
+        _, event_table_start, source_table_start, *_  = reader.readInts(5) # zero, event_offset, source_table_start, ?, ?
         data_end, event_count = reader.readInts(2)
         *_, source_count = reader.readInts(3)
 
@@ -128,16 +131,10 @@ class MsscmpParser:
         for _ in range(event_count):
             offset_event_name, offset_event_details = reader.readInts(2)
             event_name = reader.readStringAt(offset_event_name)
-            string_data_format = reader.readStringAt(offset_event_details).split(';')
-            event = BankEvent(event_name, string_data_format)
-            print(f"{string_data_format = }")
-            if string_data_format[2] == "1": # normal event data
-                source_list = string_data_format[3].split(":")
-                print(event_name, [(source_name, amount_x) for source_name, amount_x in zip(source_list[0::2], source_list[1::2])])
-            elif string_data_format[2] == "5": # Cached sounds ??
-                root_source_name = string_data_format[3]
-                source_list = string_data_format[4].split(":")
-                print(event_name, root_source_name, source_list)
+            raw_property_string = reader.readStringAt(offset_event_details)
+            event = BankEvent(event_name, raw_property_string)
+
+            event.properties = self.decodeEventProperties(raw_property_string)
 
             self.bankinfo.events[event_name] = event
 
@@ -146,25 +143,27 @@ class MsscmpParser:
 
         for _ in range(source_count):
             path_offset, info_offset = reader.readInts(2)
-            source: BankSource = readAt(stream, info_offset, self.readEntry, reader, path_offset)
+            source: BankSource = readAt(stream, info_offset, self.readBankSource, reader, path_offset)
+            if self.bankinfo.events.get(os.path.dirname(source.path), None) is not None:
+                self.bankinfo.events[os.path.dirname(source.path)].sources.append(source)
 
-            if self.bankinfo.events.get(os.path.dirname(source.bankPath), None) is not None:
-                self.bankinfo.events[os.path.dirname(source.bankPath)].sources.append(source)
+            Logger.log(source, "BankSources")
 
             if dump_path is not None:
                 self.dumpSource(stream, dump_path, source)
-        
-        if self.verbose:
-            pprint(self.bankinfo)
 
     def dumpSource(self, stream: BufferedReader, dump_path: str, bankSource: BankSource):
-        path = f"{dump_path}/{os.path.dirname(bankSource.bankPath)}"
+        path = f"{dump_path}/{os.path.dirname(bankSource.path)}"
         if not os.path.exists(path): os.makedirs(path)
-        with open(f"{dump_path}/{bankSource.bankPath}.binka", "wb") as f:
+        with open(f"{dump_path}/{bankSource.path}.binka", "wb") as f:
             binka_data = readAt(stream, bankSource.data_offset, stream.read, bankSource.file_size)
             f.write(binka_data)
 
-    def readBinkHeader(self, reader: BufferedDataReader) -> BankHeader:
+    def decodeEventProperties(self, raw_property_event_string: str) -> list[str]:
+        properties: list[str] = raw_property_event_string.split(';')
+        return properties
+
+    def readBankHeader(self, reader: BufferedDataReader) -> BankHeader:
         # version: Has to be 8 to match runtime
         # mem_usage: Number of bytes required to build entry data(name, file_name, file_location, file_size, ...)
         version, mem_usage, _ = reader.readInts(3)
@@ -172,10 +171,10 @@ class MsscmpParser:
         name = reader.readStringAt(0x38)
         return BankHeader(name, filename, mem_usage, version)
 
-    def readEntry(self, reader: BufferedDataReader, source_name_offset: int) -> BankSource:
+    def readBankSource(self, reader: BufferedDataReader, source_name_offset: int) -> BankSource:
         current_offset = reader.stream.tell()
         unknown_data = dict()
-        unknown_data["info_offset"] = current_offset
+        unknown_data["source_offset"] = current_offset
 
         recived_source_name_offset = reader.readInt()
         if (source_name_offset != recived_source_name_offset):
@@ -183,22 +182,22 @@ class MsscmpParser:
 
         bankPath = reader.readStringAt(source_name_offset)
         file_name = reader.readStringAt(reader.readInt() + current_offset)
+        unknown_data["0x08"] = hex(reader.readInt())
+        play_action = reader.readInt() # type(1 = play, 2 = loop) note: not tested!
+        unknown_data["0x10"] = reader.readInt()
+        sample_rate = reader.readInt()
         # Minimal file buffer size allocated/alignment: 4Kb
         # Note: not tested with larger binka files
         file_size = reader.readInt()
-        play_action = reader.readInt() # type(1 = play, 2 = loop)
-        unknown_data["0x10"] = reader.readInt()
-        sample_rate = reader.readInt()
-        unknown_data["0x18"] = reader.readInt()
-        unknown_data["0x1C"] = reader.readInt()
+        unknown_data["Channels"] = reader.readInt()
         unknown_data["0x20"] = reader.readInt()
-        unknown_data["0x24"] = reader.readInt()
+        duration_milliseconds = reader.readInt()
+        unknown_data["Duration"] = f"{duration_milliseconds} ms ({duration_milliseconds/1_000} sec)"
         unknown_data["0x28"] = reader.readInt()
         unknown_data["0x2C"] = reader.readInt()
         unknown_data["0x30"] = reader.readInt()
-        volume = reader.readFloat() # distant scalar
+        unknown_data["0x34"] = reader.readFloat() # distant scalar
         unknown_data["0x38"] = reader.readInt()
         data_offset = int(file_name.split('*')[-1].rsplit('.')[0]) # yes :^)
 
-        source = BankSource(source_name_offset, bankPath, file_name, file_size, sample_rate, volume, data_offset, play_action, unknown_data)
-        return source
+        return BankSource(source_name_offset, bankPath, file_name, file_size, sample_rate, data_offset, play_action, unknown_data)
